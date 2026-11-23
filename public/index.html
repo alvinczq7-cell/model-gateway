@@ -8,6 +8,7 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+  <script src="/jev-data.js"></script>
   <style>
     body {
       background: linear-gradient(135deg, #e0f2fe 0%, #f0f9ff 25%, #f8fafc 50%, #f1f5f9 75%, #e2e8f0 100%);
@@ -47,8 +48,24 @@
       font-size: 0.75rem;
       color: #2563eb;
       cursor: pointer;
+      white-space: nowrap;
     }
     .glass-btn:hover { background: rgba(59,130,246,0.25); }
+    /* 全站禁用按钮：变灰 + 半透明 + 禁止光标，hover 不再变色 */
+    button:disabled, button:disabled:hover {
+      opacity: 0.45;
+      filter: grayscale(1);
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+    /* 自定义 tooltip（图表悬停/点按） */
+    .chart-tip {
+      position: absolute; z-index: 20; pointer-events: none;
+      transform: translate(-50%, calc(-100% - 8px));
+      background: rgba(15,23,42,0.92); color: #fff;
+      font-size: 11px; line-height: 1.5; padding: 6px 8px; border-radius: 8px;
+      white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
     .glass-btn-primary {
       background: rgba(37,99,235,0.85);
       border: 1px solid rgba(37,99,235,0.3);
@@ -88,13 +105,148 @@
     const { useState, useEffect, useCallback, useRef } = React;
     const API_BASE = window.location.origin;
 
+    // ===== 3.3 Admin Token 前端鉴权（CONTRACT §6）=====
+    // 规则：/api/admin/* 与 /api/dashboard/jev 需要 x-admin-token；
+    // 收到 401 → 弹框输入 → 存 localStorage → 原请求自动重放（无需刷新页面）。
+    // 后端未配置 ADMIN_TOKEN 时不会返回 401，看板保持免鉴权可用。
+    const ADMIN_TOKEN_KEY = 'gateway.adminToken';
+    const needsAdminToken = url => /\/api\/admin\/|\/api\/dashboard\/jev(\?|$)/.test(url);
+    function readAdminToken() {
+      try { return localStorage.getItem(ADMIN_TOKEN_KEY) || ''; } catch (_) { return ''; }
+    }
+    function saveAdminToken(token) {
+      try {
+        if (token) localStorage.setItem(ADMIN_TOKEN_KEY, token);
+        else localStorage.removeItem(ADMIN_TOKEN_KEY);
+      } catch (_) {}
+    }
+
+    // 所有并发的 401 请求共用同一个弹框（同一个 Promise），输入一次全部重放
+    const authGate = {
+      pending: null,       // 正在等待用户输入的 Promise
+      resolve: null,
+      reason: null,        // 'missing' | 'invalid'，弹框里显示不同提示
+      listener: null,      // AdminTokenModal 挂载后注册，用来打开弹框
+      cancelled: false     // 用户点了“取消”：不再自动弹，直到手动点“管理员令牌”按钮
+    };
+    function askForAdminToken(reason) {
+      if (!authGate.pending) {
+        authGate.reason = reason;
+        authGate.pending = new Promise(resolve => { authGate.resolve = resolve; });
+        if (authGate.listener) authGate.listener(reason);
+      }
+      return authGate.pending;
+    }
+    function finishAdminTokenPrompt(token) {
+      const resolve = authGate.resolve;
+      authGate.pending = null;
+      authGate.resolve = null;
+      authGate.reason = null;
+      if (token === null) authGate.cancelled = true;
+      else { authGate.cancelled = false; saveAdminToken(token); }
+      if (resolve) resolve(token);
+    }
+
+    // 同一个 GET 地址正在请求中时直接复用（例如解锁令牌那一刻，多个排队的 /api/admin/tokens 只发一次）
+    const inflightGets = new Map();
+    function apiFetch(url, options = {}) {
+      const method = (options.method || 'GET').toUpperCase();
+      if (method !== 'GET') return apiFetchOnce(url, options);
+      let shared = inflightGets.get(url);
+      if (!shared) {
+        shared = apiFetchOnce(url, options);
+        inflightGets.set(url, shared);
+        const clear = () => { if (inflightGets.get(url) === shared) inflightGets.delete(url); };
+        shared.then(clear, clear);
+      }
+      return shared.then(res => res.clone());
+    }
+
+    async function apiFetchOnce(url, options = {}) {
+      let usedToken = '';
+      const send = () => {
+        const headers = new Headers(options.headers || {});
+        usedToken = readAdminToken();
+        if (needsAdminToken(url) && usedToken) headers.set('x-admin-token', usedToken);
+        return fetch(url, { ...options, headers });
+      };
+      let res = await send();
+      while (res.status === 401 && needsAdminToken(url) && !authGate.cancelled) {
+        // 如果别的请求已经让用户换了新令牌，直接用新令牌重放；否则弹框（并发请求共用一个弹框）
+        if (readAdminToken() === usedToken) {
+          const entered = await askForAdminToken(usedToken ? 'invalid' : 'missing');
+          if (entered === null) return res; // 用户取消，返回原 401
+        }
+        res = await send();
+      }
+      return res;
+    }
+
+    function AdminTokenModal() {
+      const [reason, setReason] = useState(authGate.pending ? authGate.reason : null);
+      const [value, setValue] = useState('');
+      const inputRef = useRef(null);
+
+      useEffect(() => {
+        authGate.listener = r => { setReason(r); setValue(''); };
+        return () => { authGate.listener = null; };
+      }, []);
+      useEffect(() => { if (reason && inputRef.current) inputRef.current.focus(); }, [reason]);
+
+      if (!reason) return null;
+      const submit = e => {
+        e.preventDefault();
+        const token = value.trim();
+        if (!token) return;
+        setReason(null);
+        finishAdminTokenPrompt(token);
+      };
+      const cancel = () => { setReason(null); finishAdminTokenPrompt(null); };
+
+      return (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/20 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="admin-token-title">
+          <form className="glass-card p-6 w-full max-w-sm bg-white/80" onSubmit={submit}>
+            <h3 id="admin-token-title" className="text-sm font-semibold text-gray-800 mb-1">需要管理员令牌</h3>
+            <p className="text-xs text-gray-500 mb-4">
+              {reason === 'invalid'
+                ? '保存的令牌不对或已失效，请重新输入。'
+                : '后端开启了 ADMIN_TOKEN 保护，请输入令牌后继续（只保存在本浏览器）。'}
+            </p>
+            <input ref={inputRef} type="password" autoComplete="off" className="glass-input mb-4" placeholder="x-admin-token" value={value} onChange={e => setValue(e.target.value)} />
+            <div className="flex justify-end gap-2">
+              <button type="button" className="glass-btn" onClick={cancel}>取消</button>
+              <button type="submit" className="glass-btn glass-btn-primary" disabled={!value.trim()}>确认并重试</button>
+            </div>
+          </form>
+        </div>
+      );
+    }
+
+    // 顶部按钮：手动输入/更换令牌（取消弹框后也能从这里重新打开）
+    function AdminTokenButton({ onChanged }) {
+      const [hasToken, setHasToken] = useState(!!readAdminToken());
+      const open = async () => {
+        authGate.cancelled = false;
+        const token = await askForAdminToken(readAdminToken() ? 'invalid' : 'missing');
+        setHasToken(!!readAdminToken());
+        if (token !== null && onChanged) onChanged();
+      };
+      return (
+        <button className="glass-btn text-xs px-2 py-1" onClick={open} title={hasToken ? '已保存令牌，点击更换' : '输入管理员令牌'}>
+          {hasToken ? '🔑 已登录' : '🔑 令牌'}
+        </button>
+      );
+    }
+
     function GlassCard({ children, className = '', style = {} }) {
       return (
-        <div className={`glass-card p-6 transition-all duration-300 ${className}`} style={style}>
+        <div className={`glass-card p-4 sm:p-6 transition-all duration-300 ${className}`} style={style}>
           {children}
         </div>
       );
     }
+
+    const HEALTH_LABEL = { healthy: '健康', unhealthy: '异常', unconfigured: '未配置', unknown: '未知' };
 
     function StatusDot({ status }) {
       const colorMap = {
@@ -139,7 +291,7 @@
 
       const fetchStatus = useCallback(async () => {
         try {
-          const res = await fetch(`${API_BASE}/api/admin/circuit-breaker/${channelId}`);
+          const res = await apiFetch(`${API_BASE}/api/admin/circuit-breaker/${channelId}`);
           const data = await res.json();
           setStatus(data);
         } catch (_) {}
@@ -154,13 +306,14 @@
       if (!status) return null;
 
       const isOpen = status.isOpen || false;
-      const remaining = Math.max(0, Math.ceil((new Date(status.openUntil || 0) - new Date()) / 1000));
+      // 契约写 openUntil，后端当前返回 circuitOpenUntil：两者都兼容
+      const remaining = Math.max(0, Math.ceil((new Date(status.openUntil || status.circuitOpenUntil || 0) - new Date()) / 1000));
 
       return (
         <div className="flex items-center gap-1 mt-2">
           <span className={`glow-dot ${isOpen ? 'circuit-open' : 'circuit-closed'}`}></span>
           <span className={`text-[10px] font-medium ${isOpen ? 'text-red-600' : 'text-emerald-600'}`}>
-            {isOpen ? `熔断中 ${remaining}s` : '正常'}
+            {isOpen ? `熔断：已触发（${remaining}s 后重试）` : '熔断：正常'}
           </span>
         </div>
       );
@@ -215,7 +368,7 @@
             apiKey: validKeys[0]?.apiKey || '',
             apiKeys: validKeys.map(k => k.apiKey)
           };
-          const res = await fetch(`${API_BASE}/api/admin/channels/${channel.id}`, {
+          const res = await apiFetch(`${API_BASE}/api/admin/channels/${channel.id}`, {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ config, enabled })
           });
@@ -229,8 +382,8 @@
       };
 
       return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={onClose}>
-          <div className="glass-card w-full max-w-4xl p-6 max-h-[90vh] overflow-y-auto slim-scroll" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm p-4" onClick={onClose}>
+          <div className="glass-card w-full max-w-4xl p-4 sm:p-6 max-h-[90vh] overflow-y-auto slim-scroll" onClick={e => e.stopPropagation()}>
             <h3 className="text-lg font-bold text-gray-900 mb-4">配置 {channel.name} ({channel.type})</h3>
             {error && <div className="mb-4 p-3 bg-red-100/50 border border-red-200/50 rounded-lg text-red-600 text-xs">{error}</div>}
             <div className="space-y-3">
@@ -290,7 +443,7 @@
         setError('');
         try {
           const quotaLimit = quotaLimitM * 1000000;
-          const res = await fetch(`${API_BASE}/api/admin/tokens`, {
+          const res = await apiFetch(`${API_BASE}/api/admin/tokens`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectName: projectName.trim(), quotaLimit })
@@ -310,8 +463,8 @@
       };
 
       return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={onClose}>
-          <div className="glass-card w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm p-4" onClick={onClose}>
+          <div className="glass-card w-full max-w-md p-4 sm:p-6 max-h-[90vh] overflow-y-auto slim-scroll" onClick={e => e.stopPropagation()}>
             <h3 className="text-lg font-bold text-gray-900 mb-4">创建新 Token</h3>
             {created ? (
               <div className="space-y-3">
@@ -370,7 +523,7 @@
       const handleRefresh = async () => {
         setSaving(true); setMsg('');
         try {
-          const res = await fetch(`${API_BASE}/api/admin/tokens/${token.id}/refresh`, { method: 'POST' });
+          const res = await apiFetch(`${API_BASE}/api/admin/tokens/${token.id}/refresh`, { method: 'POST' });
           if (!res.ok) throw new Error('刷新失败');
           const data = await res.json();
           setMsg('Token 已刷新');
@@ -382,7 +535,7 @@
       const handleQuotaUpdate = async () => {
         setSaving(true); setMsg('');
         try {
-          const res = await fetch(`${API_BASE}/api/admin/tokens/${token.id}/quota`, {
+          const res = await apiFetch(`${API_BASE}/api/admin/tokens/${token.id}/quota`, {
             method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ quotaLimit })
           });
           if (!res.ok) throw new Error('更新配额失败');
@@ -396,7 +549,7 @@
         if (!window.confirm('确定要删除此 Token 吗？此操作不可恢复。')) return;
         setDeleting(true);
         try {
-          const res = await fetch(`${API_BASE}/api/admin/tokens/${token.id}`, { method: 'DELETE' });
+          const res = await apiFetch(`${API_BASE}/api/admin/tokens/${token.id}`, { method: 'DELETE' });
           if (!res.ok) throw new Error('删除失败');
           onRefresh();
         } catch (e) {
@@ -448,14 +601,360 @@
     }
 
     // 主看板组件
+    // ===== 3.1 统计图表：只用 /api/dashboard/logs（契约§4），在前端按天、按项目聚合 =====
+    const STATS_LOG_LIMIT = 500;   // 图表取最近 500 条日志做统计
+    const STATS_DAYS = 7;
+
+    // SQLite datetime('now') 是 UTC 且不带时区："2026-11-23 05:28:25" → 按 UTC 解析
+    function parseLogTime(ts) {
+      if (!ts) return null;
+      const s = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(ts) ? ts.replace(' ', 'T') + 'Z' : ts;
+      const d = new Date(s);
+      return isNaN(d) ? null : d;
+    }
+    function localDayKey(d) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+    const isErrorLog = log => !(log.status_code >= 200 && log.status_code < 300);
+
+    function aggregateLogs(logs, days = STATS_DAYS, now = new Date()) {
+      const list = Array.isArray(logs) ? logs : [];
+      const dayMap = new Map();
+      for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+        dayMap.set(localDayKey(d), { day: localDayKey(d), requests: 0, errors: 0, tokens: 0 });
+      }
+      const projectMap = new Map();
+      for (const log of list) {
+        const tokens = Number(log.token_used) || 0;
+        const err = isErrorLog(log);
+        const d = parseLogTime(log.created_at);
+        const bucket = d && dayMap.get(localDayKey(d));
+        if (bucket) { bucket.requests++; bucket.tokens += tokens; if (err) bucket.errors++; }
+        const name = log.project_name || '未知项目';
+        const p = projectMap.get(name) || { project: name, requests: 0, errors: 0, tokens: 0 };
+        p.requests++; p.tokens += tokens; if (err) p.errors++;
+        projectMap.set(name, p);
+      }
+      return {
+        byDay: Array.from(dayMap.values()),
+        byProject: Array.from(projectMap.values()).sort((a, b) => b.requests - a.requests),
+        sampleSize: list.length
+      };
+    }
+
+    const formatNum = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'K' : String(n);
+
+    function MetricSwitch({ metric, onChange, label }) {
+      return (
+        <div className="flex rounded-lg overflow-hidden border border-white/60 text-[10px] flex-shrink-0" role="group" aria-label={label}>
+          {[['requests', '请求数'], ['tokens', 'Token']].map(([k, text]) => (
+            <button key={k} className={`px-2 py-1 ${metric === k ? 'bg-blue-600 text-white' : 'bg-white/40 text-gray-600'}`} onClick={() => onChange(k)} aria-pressed={metric === k}>{text}</button>
+          ))}
+        </div>
+      );
+    }
+
+    // 自定义 tooltip：鼠标悬停即时显示，手机上点按显示；坐标相对于图表容器
+    function useChartTip() {
+      const [tip, setTip] = useState(null);
+      const boxRef = useRef(null);
+      const show = (e, lines) => {
+        const box = boxRef.current; if (!box) return;
+        const r = box.getBoundingClientRect();
+        const x = Math.min(Math.max(e.clientX - r.left, 70), r.width - 70);
+        setTip({ x, y: e.clientY - r.top, lines });
+      };
+      const hide = () => setTip(null);
+      const node = tip && (
+        <div className="chart-tip" style={{ left: tip.x, top: tip.y }} role="tooltip">
+          {tip.lines.map((l, i) => <div key={i} className={i === 0 ? 'font-semibold' : ''}>{l}</div>)}
+        </div>
+      );
+      return { boxRef, show, hide, node };
+    }
+
+    const metricLabelOf = m => m === 'requests' ? '请求数' : 'Token 用量';
+
+    function DailyChart({ stats }) {
+      const [metric, setMetric] = useState('requests');
+      const { boxRef, show, hide, node } = useChartTip();
+      const dayMax = Math.max(1, ...stats.byDay.map(d => d[metric]));
+      return (
+        <GlassCard className="min-w-0">
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <h3 className="text-sm font-semibold text-gray-800">近 {STATS_DAYS} 天 · {metricLabelOf(metric)}</h3>
+            <MetricSwitch metric={metric} onChange={setMetric} label="每日图表统计口径" />
+          </div>
+          <p className="text-[10px] text-gray-400 mb-4">
+            统计自最近 {stats.sampleSize} 条调用{stats.sampleSize >= STATS_LOG_LIMIT ? '（已达上限，更早的未计入）' : ''}
+            {metric === 'requests' && <span className="ml-2"><span className="inline-block w-2 h-2 rounded-sm bg-red-400 mr-1 align-middle"></span>失败</span>}
+          </p>
+          <div ref={boxRef} className="relative" onMouseLeave={hide}>
+            <div className="flex items-end gap-1 sm:gap-2 h-40" role="img" aria-label={`近 ${STATS_DAYS} 天${metricLabelOf(metric)}柱状图`}>
+              {stats.byDay.map(d => {
+                const total = d[metric];
+                const h = (total / dayMax) * 100;
+                const errShare = metric === 'requests' && total > 0 ? d.errors / total : 0;
+                const lines = [d.day, `请求 ${d.requests}（失败 ${d.errors}）`, `Token ${d.tokens.toLocaleString()}`];
+                return (
+                  <div key={d.day} data-day={d.day} className="flex-1 min-w-0 flex flex-col items-center h-full justify-end cursor-default"
+                       onMouseEnter={e => show(e, lines)} onMouseMove={e => show(e, lines)} onClick={e => show(e, lines)}>
+                    <span className={`text-[10px] font-mono mb-1 ${total > 0 ? 'text-gray-600' : 'text-gray-300'}`}>{formatNum(total)}</span>
+                    {total > 0 ? (
+                      <div className="w-full max-w-[36px] flex flex-col justify-end rounded-t-md overflow-hidden hover:brightness-110" style={{ height: `${h}%`, minHeight: 2 }}>
+                        {errShare > 0 && <div className="bg-red-400 w-full" style={{ height: `${errShare * 100}%` }}></div>}
+                        <div className="bg-blue-500/80 w-full flex-1"></div>
+                      </div>
+                    ) : (
+                      <div className="w-full max-w-[36px] h-[2px] rounded bg-gray-300/80"></div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {node}
+          </div>
+          <div className="flex gap-1 sm:gap-2 mt-1 border-t border-white/50 pt-1">
+            {stats.byDay.map(d => <span key={d.day} className="flex-1 min-w-0 text-center text-[10px] text-gray-400">{d.day.slice(5)}</span>)}
+          </div>
+        </GlassCard>
+      );
+    }
+
+    function ProjectChart({ stats }) {
+      const [metric, setMetric] = useState('requests');
+      const { boxRef, show, hide, node } = useChartTip();
+      const projects = stats.byProject.slice(0, 6);
+      const projMax = Math.max(1, ...projects.map(p => p[metric]));
+      return (
+        <GlassCard className="min-w-0">
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <h3 className="text-sm font-semibold text-gray-800">各项目 · {metricLabelOf(metric)}</h3>
+            <MetricSwitch metric={metric} onChange={setMetric} label="项目图表统计口径" />
+          </div>
+          <p className="text-[10px] text-gray-400 mb-4">统计自最近 {stats.sampleSize} 条调用{stats.byProject.length > projects.length ? `，显示前 ${projects.length} 个项目` : ''}</p>
+          {projects.length === 0 ? (
+            <p className="text-xs text-gray-400 text-center py-12">暂无调用数据</p>
+          ) : (
+            <div ref={boxRef} className="relative space-y-3" onMouseLeave={hide}>
+              {projects.map(p => {
+                const lines = [p.project, `请求 ${p.requests}（失败 ${p.errors}）`, `Token ${p.tokens.toLocaleString()}`];
+                return (
+                  <div key={p.project} data-project={p.project} className="cursor-default" onMouseEnter={e => show(e, lines)} onMouseMove={e => show(e, lines)} onClick={e => show(e, lines)}>
+                    <div className="flex justify-between gap-2 text-xs mb-1">
+                      <span className="text-gray-700 truncate min-w-0">{p.project}</span>
+                      <span className="text-gray-500 font-mono flex-shrink-0">
+                        {formatNum(p[metric])}{metric === 'requests' && p.errors > 0 && <span className="text-red-500 ml-1">（失败 {p.errors}）</span>}
+                      </span>
+                    </div>
+                    <div className="h-2 rounded-full bg-white/60 overflow-hidden">
+                      <div className="h-full rounded-full bg-blue-500/80" style={{ width: `${(p[metric] / projMax) * 100}%`, minWidth: p[metric] > 0 ? 2 : 0 }}></div>
+                    </div>
+                  </div>
+                );
+              })}
+              {node}
+            </div>
+          )}
+        </GlassCard>
+      );
+    }
+
+    function StatsCharts({ logs }) {
+      const stats = aggregateLogs(logs);
+      return (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+          <DailyChart stats={stats} />
+          <ProjectChart stats={stats} />
+        </div>
+      );
+    }
+
+    // ===== 3.4 Jev 决策展示 =====
+    // 数据来自独立数据层 public/jev-data.js（JevData.load）：模拟数据纯前端生成，真实数据走 GET /api/dashboard/jev（契约§4）。
+    // JevPanel 只接收 { status, data }，切换数据源不需要改组件代码。
+    const JEV_LIMIT = 20;
+    const JEV_CONFIDENCE_THRESHOLD = 0.6; // 契约§1：< 0.6 必须回退基础规则，记 rule-default
+    const JEV_DECISION_STYLE = {
+      free: ['免费通道', 'bg-emerald-100 text-emerald-700'],
+      sponsored: ['赞助密钥', 'bg-blue-100 text-blue-700'],
+      aiping: ['aiping', 'bg-violet-100 text-violet-700'],
+      'rule-default': ['回退规则', 'bg-gray-100 text-gray-600']
+    };
+
+    function JevPanel({ result, source, onSourceChange }) {
+      const { status, data } = result;
+      const fallbackCount = data.filter(d => d.decision === 'rule-default').length;
+      return (
+        <GlassCard className="mb-6 min-w-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+            <h3 className="text-sm font-semibold text-gray-800">Jev 语义路由决策</h3>
+            <div className="flex items-center gap-1 text-[10px] flex-shrink-0">
+              <span className="text-gray-500">Jev 数据源</span>
+              <div className="flex rounded-lg overflow-hidden border border-white/60" role="group" aria-label="Jev 数据源（仅影响本卡片）">
+                {[['real', '真实'], ['mock', '模拟']].map(([k, label]) => (
+                  <button key={k} className={`px-2 py-1 ${source === k ? (k === 'mock' ? 'bg-amber-500 text-white' : 'bg-blue-600 text-white') : 'bg-white/40 text-gray-600'}`} onClick={() => onSourceChange(k)} aria-pressed={source === k} title="只切换 Jev 决策卡片的数据，看板其他区域始终是真实数据">{label}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <p className="text-[10px] text-gray-400 mb-3">
+            置信度低于 {JEV_CONFIDENCE_THRESHOLD} 时网关放弃 Jev 建议、回退基础规则{data.length > 0 ? ` · 最近 ${data.length} 条中回退 ${fallbackCount} 条` : ''}
+          </p>
+          {status === 'unavailable' && <p className="text-xs text-gray-400 text-center py-4">后端还没有提供 Jev 接口（联调周接入），可点右上角「Jev 数据源 → 模拟」先看效果</p>}
+          {status === 'unauthorized' && <p className="text-xs text-gray-400 text-center py-4">需要管理员令牌才能查看（点右上角 🔑）</p>}
+          {status === 'error' && <p className="text-xs text-red-400 text-center py-4">加载失败，稍后自动重试</p>}
+          {status === 'ok' && data.length === 0 && <p className="text-xs text-gray-400 text-center py-4">暂无决策记录（USE_JEV 可能未开启）</p>}
+          {data.length > 0 && (
+            <div className="space-y-2 max-h-80 overflow-y-auto slim-scroll pr-1">
+              {data.map(d => {
+                const [label, cls] = JEV_DECISION_STYLE[d.decision] || [d.decision, 'bg-gray-100 text-gray-600'];
+                const conf = Math.max(0, Math.min(1, Number(d.confidence) || 0));
+                const low = conf < JEV_CONFIDENCE_THRESHOLD;
+                return (
+                  <div key={d.request_id} className="text-xs py-2 border-b border-white/30 last:border-0">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-gray-700 min-w-0 break-words flex-1">{d.input_summary}</p>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full flex-shrink-0 ${cls}`}>{label}</span>
+                    </div>
+                    <div className="flex items-center gap-2 mt-1">
+                      <div className="relative flex-1 max-w-[160px] pt-3" title={`置信度 ${conf.toFixed(2)}（阈值 ${JEV_CONFIDENCE_THRESHOLD}）`}>
+                        <span className="absolute top-0 text-[9px] leading-none text-gray-600 -translate-x-1/2" style={{ left: `${JEV_CONFIDENCE_THRESHOLD * 100}%` }}>{JEV_CONFIDENCE_THRESHOLD}</span>
+                        <div className="relative h-1.5 rounded-full bg-gray-200/80 overflow-hidden">
+                          <div className={`h-full rounded-full ${low ? 'bg-amber-500' : 'bg-emerald-500'}`} style={{ width: `${conf * 100}%` }}></div>
+                        </div>
+                        <div className="absolute bottom-[-2px] h-[10px] w-px bg-gray-700" style={{ left: `${JEV_CONFIDENCE_THRESHOLD * 100}%` }}></div>
+                      </div>
+                      <span className={`font-mono text-[11px] font-semibold ${low ? 'text-amber-700' : 'text-gray-800'}`}>{conf.toFixed(2)}</span>
+                      <span className="font-mono text-[10px] text-gray-600 truncate min-w-0">{d.request_id}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </GlassCard>
+      );
+    }
+
+    // ===== 3.2 告警分页 + 已处理 =====
+    const ALERT_FETCH_LIMIT = 200;
+    const ALERT_PAGE_SIZE = 5;
+    const ALERT_LEVEL_LABEL = { critical: '严重', warning: '警告', info: '提示' };
+
+    function AlertsPanel({ alerts, onResolve }) {
+      const [filter, setFilter] = useState('unresolved'); // unresolved | resolved | all
+      const [page, setPage] = useState(1);
+      const [selected, setSelected] = useState(() => new Set()); // 跨页保留的勾选
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState('');
+      const [notice, setNotice] = useState('');
+
+      const list = alerts.filter(a => filter === 'all' ? true : filter === 'resolved' ? a.resolved : !a.resolved);
+      const totalPages = Math.max(1, Math.ceil(list.length / ALERT_PAGE_SIZE));
+      const current = Math.min(page, totalPages);
+      const pageItems = list.slice((current - 1) * ALERT_PAGE_SIZE, current * ALERT_PAGE_SIZE);
+      const unresolvedCount = alerts.filter(a => !a.resolved).length;
+
+      // 已经处理掉 / 不在列表里的告警，从勾选里移除
+      useEffect(() => {
+        const open = new Set(alerts.filter(a => !a.resolved).map(a => a.id));
+        setSelected(prev => {
+          const next = new Set(Array.from(prev).filter(id => open.has(id)));
+          return next.size === prev.size ? prev : next;
+        });
+      }, [alerts]);
+
+      const toggle = (id, checked) => setSelected(prev => {
+        const next = new Set(prev);
+        if (checked) next.add(id); else next.delete(id);
+        return next;
+      });
+      const pageSelectable = pageItems.filter(a => !a.resolved);
+      const pageAllChecked = pageSelectable.length > 0 && pageSelectable.every(a => selected.has(a.id));
+      const togglePage = checked => setSelected(prev => {
+        const next = new Set(prev);
+        pageSelectable.forEach(a => checked ? next.add(a.id) : next.delete(a.id));
+        return next;
+      });
+
+      const resolve = async ids => {
+        if (ids.length === 0) return;
+        setBusy(true); setError(''); setNotice('');
+        const { failed, unavailable } = await onResolve(ids);
+        setBusy(false);
+        if (unavailable) setNotice('“已处理”功能等后端接口上线后可用（组长开发中）。你的勾选已保留，上线后再点一次即可');
+        else if (failed.length > 0) setError(`${failed.length} 条处理失败，请稍后重试`);
+      };
+
+      const changeFilter = f => { setFilter(f); setPage(1); };
+
+      return (
+        <GlassCard className="mb-6 min-w-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h3 className="text-sm font-semibold text-gray-800">告警记录 <span className="text-xs font-normal text-gray-400">（未处理 {unresolvedCount}）</span></h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex rounded-lg overflow-hidden border border-white/60 text-[10px]" role="group" aria-label="告警筛选">
+                {[['unresolved', '未处理'], ['resolved', '已处理'], ['all', '全部']].map(([k, label]) => (
+                  <button key={k} className={`px-2 py-1 ${filter === k ? 'bg-blue-600 text-white' : 'bg-white/40 text-gray-600'}`} onClick={() => changeFilter(k)} aria-pressed={filter === k}>{label}</button>
+                ))}
+              </div>
+              <button className="glass-btn text-xs px-2 py-1" disabled={busy || selected.size === 0} onClick={() => resolve(Array.from(selected))}>
+                {busy ? '处理中...' : `标记已处理${selected.size > 0 ? ` (${selected.size})` : ''}`}
+              </button>
+            </div>
+          </div>
+          {error && <p className="text-xs text-red-500 mb-2">{error}</p>}
+          {notice && <p className="text-xs text-amber-700 bg-amber-50/80 border border-amber-200/70 rounded-lg px-3 py-2 mb-2" role="status">{notice}</p>}
+          {pageItems.length === 0 ? (
+            <p className="text-xs text-gray-400 text-center py-4">{filter === 'unresolved' ? '没有未处理的告警 🎉' : '暂无告警'}</p>
+          ) : (
+            <div>
+              {pageSelectable.length > 0 && (
+                <label className="flex items-center gap-2 text-[10px] text-gray-500 mb-1 cursor-pointer">
+                  <input type="checkbox" className="accent-blue-600" checked={pageAllChecked} onChange={e => togglePage(e.target.checked)} />
+                  本页全选
+                </label>
+              )}
+              {pageItems.map(alert => (
+                <div key={alert.id} className={`flex items-start gap-2 text-xs py-2 border-b border-white/30 last:border-0 ${alert.resolved ? 'opacity-60' : ''}`}>
+                  <input type="checkbox" className="accent-blue-600 mt-0.5 flex-shrink-0" aria-label={`选择告警 ${alert.id}`} disabled={!!alert.resolved} checked={selected.has(alert.id)} onChange={e => toggle(alert.id, e.target.checked)} />
+                  <span className={`glow-dot mt-1 flex-shrink-0 ${alert.level === 'critical' ? 'text-red-500' : alert.level === 'warning' ? 'text-yellow-500' : 'text-blue-500'}`}></span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-gray-700 break-words">{alert.message}</p>
+                    <p className="text-gray-400 mt-1">{ALERT_LEVEL_LABEL[alert.level] || alert.level} · {alert.created_at}</p>
+                  </div>
+                  {alert.resolved
+                    ? <span className="text-[10px] text-emerald-600 flex-shrink-0">已处理</span>
+                    : <button className="glass-btn text-[10px] px-2 py-0.5 flex-shrink-0" disabled={busy} onClick={() => resolve([alert.id])}>已处理</button>}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex items-center justify-between mt-3 text-[10px] text-gray-500">
+            <span>共 {list.length} 条{selected.size > 0 ? ` · 已勾选 ${selected.size}` : ''}</span>
+            <div className="flex items-center gap-2">
+              <button className="glass-btn text-[10px] px-2 py-0.5" disabled={current <= 1} onClick={() => setPage(current - 1)}>上一页</button>
+              <span>{current} / {totalPages}</span>
+              <button className="glass-btn text-[10px] px-2 py-0.5" disabled={current >= totalPages} onClick={() => setPage(current + 1)}>下一页</button>
+            </div>
+          </div>
+        </GlassCard>
+      );
+    }
+
     function Dashboard() {
       const [summary, setSummary] = useState({ totalRequests: 0, activeChannels: 0, totalChannels: 0, unresolvedAlerts: 0 });
       const [channels, setChannels] = useState([]);
       const [logs, setLogs] = useState([]);
       const [alerts, setAlerts] = useState([]);
+      const [jev, setJev] = useState({ status: 'loading', data: [] });
       const [tokens, setTokens] = useState([]);
       const [loading, setLoading] = useState(true);
-      const [useMock, setUseMock] = useState(false);
+      const [loadError, setLoadError] = useState('');
+      // Jev 卡片专用数据源：只影响 Jev 决策卡片，看板其他区域始终走真实接口
+      const [jevSource, setJevSource] = useState('real'); // 'real' | 'mock'
       const [activeModal, setActiveModal] = useState(null);
       const [editingChannel, setEditingChannel] = useState(null);
       const [autoRefresh, setAutoRefresh] = useState(true);
@@ -464,23 +963,50 @@
       const [batchDeleting, setBatchDeleting] = useState(false);
       const intervalRef = useRef(null);
 
+      // 3.2：标记告警已处理（契约§3 PUT /api/admin/alerts/:id/resolve）。
+      // 返回 { failed, unavailable }；成功的立即更新列表和顶部计数，再整体刷新一次。
+      // 后端还没实现该接口时，Express 返回非 JSON 的 404 → 判定为“接口未上线”，停止继续请求并友好提示。
+      const resolveAlerts = async ids => {
+        const failed = [];
+        const done = [];
+        let unavailable = false;
+        for (const id of ids) {
+          try {
+            const res = await apiFetch(`${API_BASE}/api/admin/alerts/${id}/resolve`, { method: 'PUT' });
+            if (res.ok) { done.push(id); continue; }
+            const isJson = (res.headers.get('content-type') || '').includes('application/json');
+            if (res.status === 404 && !isJson) { unavailable = true; break; }
+            failed.push(id);
+          } catch (_) { failed.push(id); }
+        }
+        if (done.length > 0) {
+          const doneSet = new Set(done);
+          const newlyResolved = alerts.filter(a => doneSet.has(a.id) && !a.resolved).length;
+          setAlerts(prev => prev.map(a => doneSet.has(a.id) ? { ...a, resolved: 1 } : a));
+          setSummary(prev => ({ ...prev, unresolvedAlerts: Math.max(0, prev.unresolvedAlerts - newlyResolved) }));
+          fetchData();
+        }
+        return { failed, unavailable };
+      };
+
       const fetchData = useCallback(async () => {
         try {
-          const endpoint = useMock ? '/api/dashboard/mock' : '/api/dashboard';
+          const endpoint = '/api/dashboard';
           const [summaryRes, channelsRes, logsRes, alertsRes] = await Promise.all([
-            fetch(`${API_BASE}${endpoint}/summary`).then(r => r.json()),
-            fetch(`${API_BASE}${endpoint}/channels`).then(r => r.json()),
-            fetch(`${API_BASE}${endpoint}/logs?limit=10`).then(r => r.json()),
-            fetch(`${API_BASE}${endpoint}/alerts?limit=10`).then(r => r.json())
+            apiFetch(`${API_BASE}${endpoint}/summary`).then(r => r.json()),
+            apiFetch(`${API_BASE}${endpoint}/channels`).then(r => r.json()),
+            apiFetch(`${API_BASE}${endpoint}/logs?limit=${STATS_LOG_LIMIT}`).then(r => r.json()),
+            apiFetch(`${API_BASE}${endpoint}/alerts?limit=${ALERT_FETCH_LIMIT}`).then(r => r.json())
           ]);
+          // 模拟数据源下没有后端可写：本地记住“已处理”，计数同步扣减
           setSummary(summaryRes);
           setChannels(channelsRes);
-          setLogs(logsRes);
-          setAlerts(alertsRes);
+          setLogs(Array.isArray(logsRes) ? logsRes : []);
+          setAlerts(Array.isArray(alertsRes) ? alertsRes : []);
 
           try {
-            const tokensRes = await fetch(`${API_BASE}/api/admin/tokens`).then(r => r.json());
-            setTokens(tokensRes);
+            const tokensRes = await apiFetch(`${API_BASE}/api/admin/tokens`).then(r => r.json());
+            setTokens(Array.isArray(tokensRes) ? tokensRes : []);
             const ids = new Set((Array.isArray(tokensRes) ? tokensRes : []).map(t => t.id));
             setSelectedIds(prev => {
               const next = new Set(Array.from(prev).filter(id => ids.has(id)));
@@ -488,12 +1014,27 @@
             });
           } catch (_) {}
 
+          setLoadError('');
           setLoading(false);
         } catch (error) {
           console.error('Fetch error:', error);
-          if (!useMock) setUseMock(true);
+          setLoadError('连接后端失败，稍后自动重试');
+          setLoading(false);
         }
-      }, [useMock]);
+      }, []);
+
+      // Jev 决策卡片单独拉取（数据源由卡片右上角开关决定）
+      const fetchJev = useCallback(() => {
+        JevData.load({ source: jevSource, limit: JEV_LIMIT, baseUrl: API_BASE, fetcher: apiFetch })
+          .then(setJev)
+          .catch(() => setJev({ status: 'error', data: [] }));
+      }, [jevSource]);
+      useEffect(() => {
+        fetchJev();
+        if (!autoRefresh) return;
+        const t = setInterval(fetchJev, 5000);
+        return () => clearInterval(t);
+      }, [fetchJev, autoRefresh]);
 
       useEffect(() => {
         fetchData();
@@ -505,7 +1046,7 @@
 
       const toggleChannelEnabled = async (channelId, newEnabled) => {
         try {
-          const res = await fetch(`${API_BASE}/api/admin/channels/${channelId}`, {
+          const res = await apiFetch(`${API_BASE}/api/admin/channels/${channelId}`, {
             method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: newEnabled })
           });
           if (res.ok) fetchData();
@@ -536,7 +1077,7 @@
         const failed = [];
         for (const id of ids) {
           try {
-            const res = await fetch(`${API_BASE}/api/admin/tokens/${id}`, { method: 'DELETE' });
+            const res = await apiFetch(`${API_BASE}/api/admin/tokens/${id}`, { method: 'DELETE' });
             if (!res.ok) {
               let detail = '';
               try { detail = (await res.json()).error || ''; } catch (_) {}
@@ -573,38 +1114,41 @@
             <div className="blur-orb absolute top-[40%] right-[20%] w-64 h-64 bg-cyan-200 rounded-full"></div>
           </div>
 
-          <div className="relative z-10 max-w-7xl mx-auto px-6 py-8">
-            <div className="mb-8 flex items-end justify-between">
+          <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+            <div className="mb-6 sm:mb-8 flex flex-col md:flex-row md:items-end md:justify-between gap-4">
               <div>
-                <h1 className="text-5xl font-black tracking-tighter text-gray-900 mb-2">
+                <h1 className="text-3xl sm:text-5xl font-black tracking-tighter text-gray-900 mb-2">
                   轻量化模型调度网关
                 </h1>
                 <p className="text-[10px] uppercase tracking-widest text-gray-500">
-                  监控看板 · Phase 1 Demo
+                  多通道监控看板
                 </p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                 <label className="flex items-center gap-1 text-[10px] text-gray-500 cursor-pointer hover:text-blue-600">
                   <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} className="accent-blue-600" />
                   自动刷新
                 </label>
                 <button className="glass-btn text-xs px-2 py-1" onClick={fetchData}>手动刷新</button>
+                <AdminTokenButton onChanged={fetchData} />
                 <button className="glass-btn" onClick={() => setActiveModal('createToken')}>+ 创建 Token</button>
               </div>
             </div>
+
+            {loadError && <p className="mb-4 text-xs text-red-500">{loadError}</p>}
 
             <div className="mb-6">
               <GlassCard className="relative overflow-hidden">
                 <div className="flex items-center justify-between">
                   <div>
                     <p className="text-[10px] uppercase tracking-widest text-gray-500 mb-2">总请求量</p>
-                    <p className="text-6xl font-black tracking-tighter text-gray-900">
+                    <p className="text-4xl sm:text-6xl font-black tracking-tighter text-gray-900">
                       {summary.totalRequests.toLocaleString()}
                     </p>
                   </div>
                   <div className="text-right">
                     <p className="text-[10px] uppercase tracking-widest text-gray-500 mb-2">活跃通道</p>
-                    <p className="text-4xl font-black tracking-tighter text-blue-600">
+                    <p className="text-3xl sm:text-4xl font-black tracking-tighter text-blue-600">
                       {summary.activeChannels} / {summary.totalChannels}
                     </p>
                   </div>
@@ -622,7 +1166,7 @@
             {/* 通道卡片（带快速开关 + 熔断状态） */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
               {channels.map(channel => (
-                <GlassCard key={channel.id} className="relative">
+                <GlassCard key={channel.id} className="relative flex flex-col h-full">
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-sm font-semibold text-gray-800">{channel.name}</h3>
                     <StatusDot status={channel.healthStatus} />
@@ -636,7 +1180,10 @@
                     </div>
                     <div className="flex justify-between text-xs">
                       <span className="text-gray-500">健康</span>
-                      <span className="font-medium text-gray-700">{channel.healthStatus}</span>
+                      <span className="font-medium text-gray-700">
+                        {HEALTH_LABEL[channel.healthStatus] || '未知'}
+                        <span className="ml-1 text-[10px] font-normal text-gray-400">{channel.healthStatus}</span>
+                      </span>
                     </div>
                     <div className="flex justify-between text-xs">
                       <span className="text-gray-500">类型</span>
@@ -651,14 +1198,18 @@
                       </div>
                     )}
                   </div>
-                  <div className="flex gap-1 mb-3">
-                    <ChannelToggle channel={channel} onChange={(v) => toggleChannelEnabled(channel.id, v)} />
-                    <button className="flex-1 glass-btn text-xs px-3 py-1.5" onClick={() => { setEditingChannel(channel); }}>配置</button>
+                  <div className="mt-auto">
+                    <div className="flex gap-1 mb-3">
+                      <ChannelToggle channel={channel} onChange={(v) => toggleChannelEnabled(channel.id, v)} />
+                      <button className="flex-1 glass-btn text-xs px-3 py-1.5" onClick={() => { setEditingChannel(channel); }}>配置</button>
+                    </div>
+                    <CircuitBreakerBadge channelId={channel.id} />
                   </div>
-                  <CircuitBreakerBadge channelId={channel.id} />
                 </GlassCard>
               ))}
             </div>
+
+            <StatsCharts logs={logs} />
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
               {/* Token 管理 */}
@@ -691,14 +1242,14 @@
                 </div>
               </GlassCard>
 
-              // 最近调用
+              {/* 最近调用 */}
               <GlassCard className="mb-6">
                 <h3 className="text-sm font-semibold text-gray-800 mb-4">最近调用</h3>
                 <div className="space-y-2 max-h-96 overflow-y-auto slim-scroll pr-1 w-full">
                   {logs.length === 0 ? (
                     <p className="text-xs text-gray-400 text-center py-4">暂无调用记录</p>
                   ) : (
-                    logs.map(log => (
+                    logs.slice(0, 10).map(log => (
                       <div key={log.id} className="border border-white/20 rounded-lg overflow-hidden bg-white/30">
                         {/* 摘要行 - 单行不换行 */}
                         <div 
@@ -768,30 +1319,13 @@
             </div>
 
             {/* 告警 */}
-            <GlassCard className="mb-6">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-semibold text-gray-800">告警记录</h3>
-              </div>
-              <div className="space-y-2 max-h-40 overflow-y-auto slim-scroll pr-1">
-                {alerts.length === 0 ? (
-                  <p className="text-xs text-gray-400 text-center py-4">暂无告警</p>
-                ) : (
-                  alerts.map(alert => (
-                    <div key={alert.id} className="flex items-start gap-2 text-xs py-2 border-b border-white/30 last:border-0">
-                      <span className={`glow-dot mt-1 ${alert.level === 'critical' ? 'text-red-500' : alert.level === 'warning' ? 'text-yellow-500' : 'text-blue-500'}`}></span>
-                      <div className="flex-1">
-                        <p className="text-gray-700">{alert.message}</p>
-                        <p className="text-gray-400 mt-1">{alert.created_at}</p>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </GlassCard>
+            <AlertsPanel alerts={alerts} onResolve={resolveAlerts} />
+
+            <JevPanel result={jev} source={jevSource} onSourceChange={setJevSource} />
 
             <div className="text-center">
               <p className="text-[10px] uppercase tracking-widest text-gray-400">
-                轻量化模型调度网关 · Phase 1 Demo · 内网访问
+                轻量化模型调度网关 · 内网访问
               </p>
             </div>
           </div>
@@ -815,7 +1349,7 @@
     }
 
     const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<Dashboard />);
+    root.render(<><Dashboard /><AdminTokenModal /></>);
   </script>
 </body>
 </html>
